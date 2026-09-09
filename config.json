@@ -1,0 +1,8 @@
+{
+  "USERID": "your_student_id",
+  "PASSWD": "your_password",
+  "LOGIN_URL": "http://10.18.1.3/gportal/web/login",
+  "AES_KEY": "1234567887654321",
+  "TRYTIME_MAX": 3,
+  "TIMEOUT": 3
+}

@@ -1,0 +1,38 @@
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.Python
+*.egg-info/
+build/
+dist/
+
+# ========== 运行产物（后续检测/日志等脚本会生成）==========
+*.log
+logs/
+*.state.json
+*_state.json
+login_state.json
+cookie*.txt
+resp*.json
+tmp/
+.tmp/
+
+# ========== 编辑器 / 系统 ==========
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.obsidian/
+
+# ========== 本地真实配置（防止误传真实账号）==========
+# 仓库只应包含“示例”config.json。请勿把含真实账号密码的配置提交进来。
+config.local.json
+config.real.json
+config.local
