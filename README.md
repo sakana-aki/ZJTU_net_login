@@ -32,7 +32,7 @@
 | 文件 | 作用 |
 | --- | --- |
 | `net_login.sh` | **登录**脚本（抓表单 → AES 加密 → POST `/gportal/web/authLogin`）。保持纯输出，供检测脚本调用 |
-| `net_watch.sh` | **检测**主脚本：ping 公网判离线 → 调 `net_login.sh` → 写日志 |
+| `net_watch.sh` | **检测**主脚本：HTTP 204 探测判离线（ICMP 不可靠，见下文）→ 调 `net_login.sh` → 写日志 |
 | `net_switch.sh` | **日常开关**：回校 `on` / 放假 `off` / `status`，只启停检测 cron 与开机自启 |
 | `config.json` | 配置（账号密码 + 检测间隔 + 日志/连通目标）。**为示例占位，需填入真实账号** |
 | `install.sh` | 一次性部署 / 状态查看 / 卸载 |
@@ -187,7 +187,11 @@ sh /root/net_login/net_switch.sh status
   "ERR_LOG_DIR": "/root/net_login/logs",
   "PING_TARGETS": "223.5.5.5 114.114.114.114",
   "PING_COUNT": 2,
-  "PING_WAIT": 2
+  "PING_WAIT": 2,
+  "HTTP_CHECK_URLS": "http://wifi.vivo.com.cn/generate_204 http://connectivitycheck.platform.hicloud.com/generate_204",
+  "HTTP_CHECK_CODE": 204,
+  "HTTP_TIMEOUT": 5,
+  "FOREIGN_CHECK_URL": ""
 }
 ```
 
@@ -201,8 +205,16 @@ sh /root/net_login/net_switch.sh status
 | `CHECK_INTERVAL` | `300` | 检测间隔（**秒**）。cron 每分钟触发一次，内部按此节流，故实际粒度 ≥60s |
 | `LOG_DIR` | `/var/log/net_login` | **access.log** 目录（默认 tmpfs，重启清空） |
 | `ERR_LOG_DIR` | 脚本同目录 `logs/` | **error.log** 目录，**应指向 flash**（如 `/root/net_login/logs`），重启后仍保留历史错误 |
-| `PING_TARGETS` | `223.5.5.5 114.114.114.114` | 空格分隔的连通性探测目标（IP 或域名），**任一可达即判在线** |
+| `HTTP_CHECK_URLS` | vivo/hicloud 两个 `generate_204` | 空格分隔的**在线判据**：任一返回 `HTTP_CHECK_CODE` 即视为在线。走 DIRECT，测的是校园真实数据面，**不用 ICMP**（见下方说明） |
+| `HTTP_CHECK_CODE` | `204` | 期望的 HTTP 状态码；门户劫持/重定向时会返回 302/200，即判为离线 |
+| `HTTP_TIMEOUT` | `5` | 单次 HTTP 探测超时（秒） |
+| `FOREIGN_CHECK_URL` | 空（跳过） | 可选。填一个境外 `generate_204`（如 `http://www.gstatic.com/generate_204`）可区分「代理挂了」还是「校园挂了」；留空则不探测 |
+| `PING_TARGETS` | `223.5.5.5 114.114.114.114` | 仅在无 `curl` 时作为在线判据的兜底；同时用于离线快照里的 ping 记录 |
 | `PING_COUNT` / `PING_WAIT` | `2` / `2` | 每个目标的 ping 次数与每包等待秒数 |
+
+> **为什么不用 ping 判在线**：校园认证失效/被踢时，ICMP 常常**仍然通**（很多门户只拦
+> TCP/DNS），此时纯 ping 会一直判 `online`，永远不会触发重登——这正是「重启才好一次」
+> 的根源之一。改用国内 HTTP 204 探测后，「ICMP 通但数据面死」也会被判离线并自动重登。
 
 > ⚠️ `config.json` 含账号密码，**请勿提交到公开仓库**。本仓库仅提供占位示例。
 
@@ -215,23 +227,28 @@ sh /root/net_login/net_switch.sh status
 两个日志**分开放**，各取所需：
 
 - `$LOG_DIR/access.log`（默认 `/var/log/net_login`，**tmpfs，重启清空**）：每次实际检测的
-  结果 —— `online`（在线）/ `recovered`（此前离线，本次触发登录成功或本就已在线）/
+  结果 —— `online` / `online (foreign recovered)` / `recovered` /
   `net_switch: enabled|disabled`（开关轨迹）。高频、体积大，故留在内存盘。
-- `$ERR_LOG_DIR/error.log`（默认脚本同目录 `logs/`，**落 flash，重启保留**）：只在
-  「离线且登录失败」时写（含退出码与服务端原因），也会记脚本异常。低频、体积小，
-  且是排错时最想回看的，故持久化。
+- `$ERR_LOG_DIR/error.log`（默认脚本同目录 `logs/`，**落 flash，重启保留**）：写**故障现场**
+  与登录失败原因。校园侧异常按「状态变化」记一条带快照的行；`foreign path down` 记代理侧
+  异常；登录失败记退出码与服务端原因。低频、体积小，且是排错时最想回看的，故持久化。
 
 行格式（统一单行，方便 `grep`）：
 
 ```
 2026-09-10 08:00:00 INFO  online
 2026-09-10 08:05:00 INFO  recovered
-2026-09-10 08:05:00 ERROR offline, login failed rc=1: [3/3] login failed: 账号或密码错误
+2026-09-10 08:06:00 ERROR offline [ping: 223.5.5.5=no 114.114.114.114=no cn_http=000 foreign_http=000 portal_http=000]
+2026-09-10 08:07:00 ERROR foreign path down (domestic ok) [ping: 223.5.5.5=ok cn_http=204 foreign_http=000 portal_http=403]
+2026-09-10 08:08:00 ERROR login failed rc=1: [3/3] login failed: 账号或密码错误
 ```
 
-> 失败原因取自门户返回，可能是中文；access 只保留 `online`/`recovered` 这类极短标记，
-> 诊断详情全部进 error.log，从而日志体积很小。
-> error.log 只在首次失败时创建；一直 `online` 就没有这个文件，属正常（不是没记）。
+> **离线快照**：`offline [...]` 那一行是现场证据，用来一眼分清是谁挂了——
+> - `cn_http=204` + `foreign_http=000`：校园好、**代理/节点挂了**；
+> - `cn_http` 非 204/000：**校园侧**（掉线/被踢/门户劫持）；
+> - 全 `000` 且 ping 全 `no`：WAN 链路或上游问题。
+>
+> 失败原因取自门户返回，可能是中文；access 只保留极短标记，诊断详情全部进 error.log。
 
 查看方式：
 
@@ -274,12 +291,15 @@ ls /var/log/net_login/ /root/net_login/logs/    # 看到 .1 / .1.gz 即已轮转
 
 | 现象 | 处理 |
 | --- | --- |
-| **找不到 error.log**（文件不存在） | 正常：只有首次「离线且登录失败」才创建，一直 online 就没有；`ls $ERR_LOG_DIR` 确认，或手动 `net_watch.sh once` 触发 |
+| **找不到 error.log**（文件不存在） | 正常：只在出现离线/代理异常/登录失败时才有内容，一直 online 就没有该行；`ls $ERR_LOG_DIR` 确认，或手动 `net_watch.sh once` 触发 |
 | error.log 重启后不见了 | 说明 `ERR_LOG_DIR` 落在了 tmpfs。改到 flash（默认 `/root/net_login/logs`），并在 logrotate 里同步该路径 |
 | error.log 一直 `login failed: 账号不存在/密码错误` | 检查 config.json 真实账号；看服务端返回原因 |
 | error.log 出现 `操作过于频繁/请求过快` | 门户限流约 5s，勿高频触发；已内置重试间隔 |
-| access.log 一直 `offline...failed` 但实际能上网 | ping 目标在你这被墙/不响应 ICMP。把 `PING_TARGETS` 换成确实可达的地址，如 `223.5.5.5`、`114.114.114.114` 或本地公共 DNS |
-| access.log 一直 `online` 但断网没重登 | 说明 ping 目标在认证失效后仍可达（少见）。把目标换成「认证后才可达」的地址 |
+| error.log 出现 `offline [cn_http=000 ...]` 但门户页能打开 | 探测 URL 被你这的网络拦了。换 `HTTP_CHECK_URLS` 成可达的国内 204 地址，或把 `HTTP_CHECK_CODE` 调成实际返回码 |
+| error.log 反复 `foreign path down (domestic ok)` | 校园好、**代理/节点挂了**：这是机场问题，不是脚本。去 OpenClash 换节点，或把兜底规则从手动 `select` 组改到 `fallback`/`url-test` 组以自动切换 |
+| access.log 一直 `online` 但断网没重登 | 旧版用 ping 判在线才会有此问题；现版用 HTTP 204 判据，若仍复现请检查 `HTTP_CHECK_URLS` 是否被劫持 |
+| access.log 无新行 | 检查 cron 是否启用（`/etc/init.d/cron start`）、`/etc/crontabs/root` 是否有条目、手动跑一次看报错 |
+| 想区分设备/校园/代理故障 | 直接看 error.log 的 `offline [...]` 快照：`cn_http` 正常而 `foreign_http=000` → 代理；`cn_http` 异常 → 校园；全 000 且 ping 全 no → WAN |
 | access.log 无新行 | 检查 cron 是否启用（`/etc/init.d/cron start`）、`/etc/crontabs/root` 是否有条目、手动跑一次看报错 |
 | 忘了检测开没开 | `sh /root/net_login/net_switch.sh status` 看 cron/自启/最近日志（state ON/OFF） |
 | 想确认关闭后什么都不跑 | `net_switch.sh off` 已移除 cron 与自启并终止在跑的检测；`status` 显示 `OFF` 即为空 |
@@ -297,8 +317,10 @@ ls /var/log/net_login/ /root/net_login/logs/    # 看到 .1 / .1.gz 即已轮转
 - **开机首检**：`/etc/init.d/net_watch`（`START=99`）开机即执行 `once`；时间戳存
   `/tmp`（重启清零），即便 init 未触发，重启后第一次 cron 也必然补检。
 - **防重入**：锁文件存 PID，检测过程超过 1 分钟时下一 tick 会跳过，不重复登录。
-- **判定**：依次 ping `PING_TARGETS`，任一回应即在线；全不通视为离线 → 调
-  `net_login.sh` 一次（其内部自带重试与「已在线则免登」判断）。
+- **判定**：逐个请求 `HTTP_CHECK_URLS`（国内、DIRECT），任一返回 `HTTP_CHECK_CODE` 即在线；
+  全不匹配视为离线 → 记录一行快照（`offline [...]`）后调 `net_login.sh` 一次（其内部自带
+  重试与「已在线则免登」判断）。若配置了 `FOREIGN_CHECK_URL`，国内通而它不通则记为
+  `foreign path down`（代理侧），**不触登录**，仅留证据。
 
 ---
 

@@ -10,5 +10,9 @@
   "ERR_LOG_DIR": "/root/net_login/logs",
   "PING_TARGETS": "223.5.5.5 114.114.114.114",
   "PING_COUNT": 2,
-  "PING_WAIT": 2
+  "PING_WAIT": 2,
+  "HTTP_CHECK_URLS": "http://wifi.vivo.com.cn/generate_204 http://connectivitycheck.platform.hicloud.com/generate_204",
+  "HTTP_CHECK_CODE": 204,
+  "HTTP_TIMEOUT": 5,
+  "FOREIGN_CHECK_URL": ""
 }
