@@ -1,7 +1,8 @@
 #!/bin/sh
 # campus-net watchdog: detect connectivity, auto-relogin if offline (OpenWrt/busybox).
 # Called by cron every minute (internally throttled to CHECK_INTERVAL); boot runs "once".
-# Logs (English, compact) -> $LOG_DIR/access.log / error.log; rotated via logrotate.
+# Logs (English, compact): access.log in LOG_DIR (tmpfs), error.log in ERR_LOG_DIR (flash,
+# survives reboot); both rotated via logrotate.
 #
 # usage: net_watch.sh [cron|once|check]   (no-arg/check=check now if due; cron=throttled
 #                                          minute call; once=force now)
@@ -14,8 +15,10 @@ cfg_get() {
 }
 
 LOG_DIR=$(cfg_get LOG_DIR);   [ -z "$LOG_DIR" ]   && LOG_DIR=/var/log/net_login
+# access.log lives on tmpfs (volatile, high volume); error.log persists to flash (rare, worth keeping)
+ERR_LOG_DIR=$(cfg_get ERR_LOG_DIR); [ -z "$ERR_LOG_DIR" ] && ERR_LOG_DIR="$DIR/logs"
 ACCESS_LOG="$LOG_DIR/access.log"
-ERROR_LOG="$LOG_DIR/error.log"
+ERROR_LOG="$ERR_LOG_DIR/error.log"
 CHECK_INTERVAL=$(cfg_get CHECK_INTERVAL); [ -z "$CHECK_INTERVAL" ] && CHECK_INTERVAL=300
 PING_TARGETS=$(cfg_get PING_TARGETS);     [ -z "$PING_TARGETS" ]   && PING_TARGETS="223.5.5.5 114.114.114.114"
 PING_COUNT=$(cfg_get PING_COUNT);         [ -z "$PING_COUNT" ]     && PING_COUNT=2
@@ -32,7 +35,7 @@ ts() { date '+%Y-%m-%d %H:%M:%S'; }
 # single-line log (multi-line collapsed), also echoes to stdout unless QUIET
 say() {
     file=$1 lv=$2; shift 2
-    [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null
+    d=$(dirname "$file"); [ -d "$d" ] || mkdir -p "$d" 2>/dev/null
     msg=$(printf '%s' "$*" | tr '\n' ' ')
     printf '%s %-5s %s\n' "$(ts)" "$lv" "$msg" >> "$file"
     if [ "$QUIET" -ne 1 ]; then

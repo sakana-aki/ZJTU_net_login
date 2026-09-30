@@ -19,7 +19,9 @@ cfg_get() {
 }
 
 LOG_DIR=$(cfg_get LOG_DIR); [ -z "$LOG_DIR" ] && LOG_DIR=$LOG_DIR_DEFAULT
+ERR_LOG_DIR=$(cfg_get ERR_LOG_DIR); [ -z "$ERR_LOG_DIR" ] && ERR_LOG_DIR="$DEST/logs"
 ACCESS="$LOG_DIR/access.log"
+ERROR="$ERR_LOG_DIR/error.log"
 
 info() { printf '[net_switch] %s\n' "$@"; }
 die()  { printf '[net_switch][ERROR] %s\n' "$@"; exit 1; }
@@ -108,7 +110,7 @@ do_off() {
 
 do_status() {
     need_root
-    cron_on=$(grep -c '/net_watch.sh cron' "$CRONTAB" 2>/dev/null)
+    cron_on=$(grep -c '/net_watch.sh cron' "$CRONTAB" 2>/dev/null); [ -z "$cron_on" ] && cron_on=0
     # on OpenWrt "enabled" == /etc/rc.d/S*net_watch symlink exists (rc.common enable)
     init_on=0
     if ls /etc/rc.d/S*net_watch >/dev/null 2>&1; then
@@ -120,8 +122,10 @@ do_status() {
     echo "  cron entry   : $([ "$cron_on" -ge 1 ] && echo yes || echo no)"
     echo "  boot autostart: $([ "$init_on" -eq 1 ] && echo yes || echo no)"
     echo "  logrotate cfg: $([ -f /etc/logrotate.d/net_login ] && echo present || echo none)"
-    echo "  recent logs:"
-    tail -n 6 "$LOG_DIR/access.log" 2>/dev/null || echo "    (no access.log yet; run: $DEST/net_watch.sh once)"
+    echo "  recent access.log ($LOG_DIR/access.log, tmpfs):"
+    tail -n 6 "$ACCESS" 2>/dev/null || echo "    (no access.log yet; run: $DEST/net_watch.sh once)"
+    echo "  recent error.log ($ERROR, flash):"
+    tail -n 6 "$ERROR" 2>/dev/null || echo "    (no error.log yet — good sign; created on first failure)"
 }
 
 do_help() {

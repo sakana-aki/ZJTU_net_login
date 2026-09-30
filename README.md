@@ -75,9 +75,13 @@ chmod +x /root/net_login/net_login.sh /root/net_login/net_watch.sh /root/net_log
 
 ### 2. 写 logrotate
 
+日志分两处：`access.log` 在 `LOG_DIR`（默认 `/var/log/net_login`，tmpfs，重启即清）；
+`error.log` 在 `ERR_LOG_DIR`（默认脚本同目录的 `logs/`，**落 flash，重启保留**）。
+
 ```sh
+mkdir -p /root/net_login/logs        # error.log 的持久化目录（按 config 的 ERR_LOG_DIR 调整）
 cat > /etc/logrotate.d/net_login <<'EOF'
-# 策略：access 按大小 0.5MB；error 按天，保留 3 天，昨天的(.1)不压缩(delaycompress)
+# 策略：access 按大小 0.5MB（tmpfs）；error 按天，保留 3 天，昨天的(.1)不压缩(delaycompress)
 /var/log/net_login/access.log {
     size 500k
     rotate 2
@@ -86,7 +90,7 @@ cat > /etc/logrotate.d/net_login <<'EOF'
     notifempty
     create 0644 root root
 }
-/var/log/net_login/error.log {
+/root/net_login/logs/error.log {
     daily
     rotate 3
     delaycompress
@@ -96,7 +100,7 @@ cat > /etc/logrotate.d/net_login <<'EOF'
     create 0644 root root
 }
 EOF
-# 若改了 config.json 的 LOG_DIR，请同步改上面两段里的日志路径
+# 若改了 config.json 的 LOG_DIR / ERR_LOG_DIR，请同步改上面两段里的日志路径
 ```
 
 ### 3. 加每分钟 cron
@@ -180,6 +184,7 @@ sh /root/net_login/net_switch.sh status
   "TIMEOUT": 3,
   "CHECK_INTERVAL": 300,
   "LOG_DIR": "/var/log/net_login",
+  "ERR_LOG_DIR": "/root/net_login/logs",
   "PING_TARGETS": "223.5.5.5 114.114.114.114",
   "PING_COUNT": 2,
   "PING_WAIT": 2
@@ -194,7 +199,8 @@ sh /root/net_login/net_switch.sh status
 | `TRYTIME_MAX` | `3` | 登录失败最大重试次数 |
 | `TIMEOUT` | `3` | 单次网络请求超时（秒） |
 | `CHECK_INTERVAL` | `300` | 检测间隔（**秒**）。cron 每分钟触发一次，内部按此节流，故实际粒度 ≥60s |
-| `LOG_DIR` | `/var/log/net_login` | 日志目录 |
+| `LOG_DIR` | `/var/log/net_login` | **access.log** 目录（默认 tmpfs，重启清空） |
+| `ERR_LOG_DIR` | 脚本同目录 `logs/` | **error.log** 目录，**应指向 flash**（如 `/root/net_login/logs`），重启后仍保留历史错误 |
 | `PING_TARGETS` | `223.5.5.5 114.114.114.114` | 空格分隔的连通性探测目标（IP 或域名），**任一可达即判在线** |
 | `PING_COUNT` / `PING_WAIT` | `2` / `2` | 每个目标的 ping 次数与每包等待秒数 |
 
@@ -206,9 +212,14 @@ sh /root/net_login/net_switch.sh status
 
 ### 日志文件（英文、精简）
 
-- `$LOG_DIR/access.log`：每次实际检测的结果 —— `online`（在线）/ `recovered`（此前离线，
-  本次触发登录成功或本就已在线）/ `net_switch: enabled|disabled`（开关轨迹）
-- `$LOG_DIR/error.log`：离线且登录失败（含退出码与服务端原因）、脚本异常
+两个日志**分开放**，各取所需：
+
+- `$LOG_DIR/access.log`（默认 `/var/log/net_login`，**tmpfs，重启清空**）：每次实际检测的
+  结果 —— `online`（在线）/ `recovered`（此前离线，本次触发登录成功或本就已在线）/
+  `net_switch: enabled|disabled`（开关轨迹）。高频、体积大，故留在内存盘。
+- `$ERR_LOG_DIR/error.log`（默认脚本同目录 `logs/`，**落 flash，重启保留**）：只在
+  「离线且登录失败」时写（含退出码与服务端原因），也会记脚本异常。低频、体积小，
+  且是排错时最想回看的，故持久化。
 
 行格式（统一单行，方便 `grep`）：
 
@@ -220,46 +231,51 @@ sh /root/net_login/net_switch.sh status
 
 > 失败原因取自门户返回，可能是中文；access 只保留 `online`/`recovered` 这类极短标记，
 > 诊断详情全部进 error.log，从而日志体积很小。
+> error.log 只在首次失败时创建；一直 `online` 就没有这个文件，属正常（不是没记）。
 
 查看方式：
 
 ```sh
-tail -f /var/log/net_login/access.log     # 实时看检测/登录
-tail -f /var/log/net_login/error.log      # 只看失败
-sh /root/net_login/install.sh status      # 一行看配置+日志摘要
+tail -f /var/log/net_login/access.log          # 实时看检测/登录（tmpfs）
+tail -f /root/net_login/logs/error.log         # 只看失败（flash，重启后仍能回看）
+sh /root/net_login/install.sh status           # 一行看配置+两份日志摘要
 ```
 
 ### 轮转
 
 `/etc/logrotate.d/net_login`（install.sh 写入，两段各自独立策略）：
 
-| 日志 | 策略 |
-| --- | --- |
-| `access.log` | `size 500k` 超过 0.5MB 触发；保留 2 份 gzip |
-| `error.log` | `daily` 每天切一次；保留 3 份；`delaycompress` 昨天的（`.1`）不压缩 |
+| 日志 | 位置 | 策略 |
+| --- | --- | --- |
+| `access.log` | tmpfs | `size 500k` 超过 0.5MB 触发；保留 2 份 gzip |
+| `error.log` | flash | `daily` 每天切一次；保留 3 份；`delaycompress` 昨天的（`.1`）不压缩 |
 
 触发时机：系统 cron 里的 logrotate 条目（install.sh 默认加每日 04:00；
 若系统已有全局 logrotate 调度则跳过）。手动验证：
 
 ```sh
-/usr/sbin/logrotate -d /etc/logrotate.conf   # 试运行(dry-run)
-ls /var/log/net_login/                       # 看到 .1 / .1.gz 即已轮转
+/usr/sbin/logrotate -d /etc/logrotate.conf      # 试运行(dry-run)
+ls /var/log/net_login/ /root/net_login/logs/    # 看到 .1 / .1.gz 即已轮转
 ```
 
 ### 减小存储占用（路由器 flash / RAM）
 
+- **只有 error.log 落 flash**：高频的 `access.log` 留在 tmpfs（内存盘），只有低频、体积小、
+  排错最想回看的 `error.log` 写到 flash，兼顾省 flash 与可追溯。用 `df /var/log` 先确认
+  `/var/log` 是否软链到 `/tmp`（OpenWrt 常见）。
 - 日志文案已精简为英文短标记；离线失败只写**一条** error（此前会重复整段重试记录）。
-- OpenWrt 里 `/var/log` 通常软链到 `/tmp`（tmpfs，**内存**而非 flash）——先 `df /var/log`
-  确认；若在 tmpfs 上，日志根本不占 flash。
-- 检测时间戳、互斥锁都放 `/tmp`，不落 flash。
+- 检测时间戳、互斥锁都放 `/tmp`（`LOG_DIR/.watch.lock`），不落 flash。
 - logrotate 用 rename+create（非 copytruncate），轮转时**不整份拷贝**日志，少写 flash。
 - 脚本自身很小；想再省可删除各 `.sh` 内注释后部署。
-- 如需长期不落盘，也可把 `LOG_DIR` 指到 tmpfs 路径，但重启会清空历史日志。
+- 不想让 error.log 也落 flash 时，把 `ERR_LOG_DIR` 指回 tmpfs（如 `/var/log/net_login`）即可，
+  代价是重启后历史错误丢失。
 
 ### 常见问题
 
 | 现象 | 处理 |
 | --- | --- |
+| **找不到 error.log**（文件不存在） | 正常：只有首次「离线且登录失败」才创建，一直 online 就没有；`ls $ERR_LOG_DIR` 确认，或手动 `net_watch.sh once` 触发 |
+| error.log 重启后不见了 | 说明 `ERR_LOG_DIR` 落在了 tmpfs。改到 flash（默认 `/root/net_login/logs`），并在 logrotate 里同步该路径 |
 | error.log 一直 `login failed: 账号不存在/密码错误` | 检查 config.json 真实账号；看服务端返回原因 |
 | error.log 出现 `操作过于频繁/请求过快` | 门户限流约 5s，勿高频触发；已内置重试间隔 |
 | access.log 一直 `offline...failed` 但实际能上网 | ping 目标在你这被墙/不响应 ICMP。把 `PING_TARGETS` 换成确实可达的地址，如 `223.5.5.5`、`114.114.114.114` 或本地公共 DNS |

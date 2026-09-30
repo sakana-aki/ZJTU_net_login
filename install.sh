@@ -13,6 +13,7 @@ DEST=$(cd "$(dirname "$0")" && pwd)
 CONF="$DEST/config.json"
 CRONTAB=/etc/crontabs/root
 LOG_DIR_DEFAULT=/var/log/net_login
+ERR_LOG_DIR_DEFAULT="$DEST/logs"
 
 cfg_get() {
     sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"*\([^\",}]*\)\"*.*/\1/p" "$CONF" | head -n 1
@@ -60,9 +61,12 @@ ensure_deps() {
 write_logrotate() {
     LOG_DIR=$(cfg_get LOG_DIR)
     [ -z "$LOG_DIR" ] && LOG_DIR=$LOG_DIR_DEFAULT
+    ERR_LOG_DIR=$(cfg_get ERR_LOG_DIR)
+    [ -z "$ERR_LOG_DIR" ] && ERR_LOG_DIR=$ERR_LOG_DIR_DEFAULT
     mkdir -p /etc/logrotate.d
     cat > /etc/logrotate.d/net_login <<EOF
 # campus-net_login logs (rotated via rename+create, no full copy)
+# access.log: tmpfs (volatile); error.log: on flash (survives reboot)
 $LOG_DIR/access.log {
     size 500k
     rotate 2
@@ -71,7 +75,7 @@ $LOG_DIR/access.log {
     notifempty
     create 0644 root root
 }
-$LOG_DIR/error.log {
+$ERR_LOG_DIR/error.log {
     daily
     rotate 3
     delaycompress
@@ -138,12 +142,25 @@ EOF
     fi
 }
 
+# ---------- log dirs: access on tmpfs, error on flash (create so it's tail-able now) ----------
+init_logs() {
+    LOG_DIR=$(cfg_get LOG_DIR)
+    [ -z "$LOG_DIR" ] && LOG_DIR=$LOG_DIR_DEFAULT
+    ERR_LOG_DIR=$(cfg_get ERR_LOG_DIR)
+    [ -z "$ERR_LOG_DIR" ] && ERR_LOG_DIR=$ERR_LOG_DIR_DEFAULT
+    mkdir -p "$LOG_DIR" "$ERR_LOG_DIR" 2>/dev/null
+    # create if missing without truncating an existing log (`: >>` appends nothing)
+    : >> "$ERR_LOG_DIR/error.log" 2>/dev/null
+    info "log dirs: access=$LOG_DIR (tmpfs) / error=$ERR_LOG_DIR (flash)"
+}
+
 # ---------- actions ----------
 do_install() {
     need_root
     need_files
     warn_if_placeholder
     ensure_deps
+    init_logs
     write_logrotate
     add_cron_watch
     add_cron_logrotate
@@ -153,7 +170,8 @@ do_install() {
     info "install done, running one check now:"
     "$DEST/net_watch.sh" once || echo "[install] check/login did not pass (offline or no real account), see logs above"
     echo
-    echo "  logs:    tail -f /var/log/net_login/access.log"
+    echo "  logs:    tail -f $LOG_DIR/access.log        # access (tmpfs)"
+    echo "           tail -f $ERR_LOG_DIR/error.log      # errors (flash)"
     echo "  inspect: sh $DEST/install.sh status"
 }
 
@@ -176,10 +194,11 @@ do_status() {
     echo; echo "== cron =="; grep -E 'net_login|net_watch|logrotate' "$CRONTAB" 2>/dev/null || echo "(none)"
     echo; echo "== logrotate =="; [ -f /etc/logrotate.d/net_login ] && cat /etc/logrotate.d/net_login || echo "(no /etc/logrotate.d/net_login)"
     LOG_DIR=$(cfg_get LOG_DIR); [ -z "$LOG_DIR" ] && LOG_DIR=$LOG_DIR_DEFAULT
-    echo; echo "== logs $LOG_DIR =="
-    ls -l "$LOG_DIR" 2>/dev/null || echo "(no logs yet, run once: $DEST/net_watch.sh once)"
-    [ -f "$LOG_DIR/access.log" ] && { echo "--- access.log last 10 ---"; tail -n 10 "$LOG_DIR/access.log"; }
-    [ -f "$LOG_DIR/error.log" ]  && { echo "--- error.log last 10 ---"; tail -n 10 "$LOG_DIR/error.log"; }
+    ERR_LOG_DIR=$(cfg_get ERR_LOG_DIR); [ -z "$ERR_LOG_DIR" ] && ERR_LOG_DIR=$ERR_LOG_DIR_DEFAULT
+    echo; echo "== logs (access: $LOG_DIR tmpfs | error: $ERR_LOG_DIR flash) =="
+    ls -l "$LOG_DIR" "$ERR_LOG_DIR" 2>/dev/null || echo "(no logs yet, run once: $DEST/net_watch.sh once)"
+    [ -f "$LOG_DIR/access.log" ]     && { echo "--- access.log last 10 ---"; tail -n 10 "$LOG_DIR/access.log"; }
+    [ -f "$ERR_LOG_DIR/error.log" ]  && { echo "--- error.log last 10 ---"; tail -n 10 "$ERR_LOG_DIR/error.log"; }
 }
 
 do_uninstall() {
