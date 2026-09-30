@@ -187,7 +187,11 @@ do_status() {
     echo "== dir =="; ls -l "$DEST"/net_login.sh "$DEST"/net_watch.sh "$DEST"/install.sh 2>/dev/null
     echo; echo "== boot item =="
     if [ -f /etc/init.d/net_watch ]; then
-        [ -L /etc/rc.d/S*net_watch ] && echo "enabled (/etc/init.d/net_watch)" || echo "present but not enabled"
+        if ls /etc/rc.d/S*net_watch >/dev/null 2>&1; then
+            echo "enabled (/etc/init.d/net_watch)"
+        else
+            echo "present but not enabled"
+        fi
     else
         echo "(no /etc/init.d/net_watch)"
     fi
