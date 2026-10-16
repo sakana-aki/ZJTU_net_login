@@ -1,7 +1,10 @@
 #!/bin/sh
-# campus-net watchdog: detect connectivity, auto-relogin if offline (OpenWrt/busybox).
-# Online == a domestic HTTP 204 succeeds (real data path); a dead proxy path and the
-# campus state at each outage are recorded to error.log for later classification.
+# campus-net watchdog: detect connectivity, auto-recover if offline (OpenWrt/busybox).
+# Online == a domestic HTTP 204 succeeds (real data path). Two offline modes are handled:
+#   - link lost (gateway stops answering ARP, INCOMPLETE): re-DHCP the WAN via `ifup wan`
+#     (throttled by HEAL_INTERVAL) — a portal login cannot fix a dead local link;
+#   - link fine but de-authed: re-login to the campus portal (net_login.sh).
+# A dead proxy path and the campus state at each outage are recorded to error.log.
 # Called by cron every minute (internally throttled to CHECK_INTERVAL); boot runs "once".
 # Logs (English, compact): access.log in LOG_DIR (tmpfs), error.log in ERR_LOG_DIR (flash,
 # survives reboot); both rotated via logrotate.
@@ -39,7 +42,9 @@ FOREIGN_CHECK_URL=$(cfg_get FOREIGN_CHECK_URL)
 
 # stamp in /tmp: cleared on reboot => first cron after boot always checks
 STAMP="${TMPDIR:-/tmp}/.net_login.last"
-STATE="${TMPDIR:-/tmp}/.net_login.state"   # last verdict: ok|proxy|campus
+STATE="${TMPDIR:-/tmp}/.net_login.state"   # last verdict: ok|proxy|campus|l2
+HEAL_STAMP="${TMPDIR:-/tmp}/.net_heal.last"  # last time we re-DHCP'd the WAN
+HEAL_INTERVAL=$(cfg_get HEAL_INTERVAL); [ -z "$HEAL_INTERVAL" ] && HEAL_INTERVAL=600
 LOCK="$LOG_DIR/.watch.lock"
 
 QUIET=0
@@ -88,6 +93,30 @@ online_foreign() {
     command -v curl >/dev/null 2>&1 || return 0
     [ "$(http_code "$FOREIGN_CHECK_URL")" = "$HTTP_CHECK_CODE" ] && return 0
     return 1
+}
+
+# default IPv4 gateway of the WAN link (empty if none)
+default_gw() { ip route 2>/dev/null | sed -n 's/^default via \([0-9.]*\).*/\1/p' | head -n 1; }
+
+# Link-level reachability of the gateway: INCOMPLETE/FAILED ARP means the access
+# layer stopped answering ARP, so the local link is dead and a portal login cannot
+# help — only a fresh DHCP (ifup wan) can. Absent/REACHABLE/STALE => not L2-down.
+# Sets $GW to the gateway for the caller (used for logging) so it isn't re-resolved.
+gw_l2_down() {
+    GW=$(default_gw)
+    [ -n "$GW" ] || return 1
+    st=$(ip neigh show "$GW" 2>/dev/null | awk 'NF{print $NF; exit}')
+    case "$st" in INCOMPLETE|FAILED) return 0 ;; esac
+    return 1
+}
+
+# Re-DHCP the WAN, throttled: recovery is not instant (DHCP + re-auth takes a few
+# minutes), so back off HEAL_INTERVAL between attempts instead of hammering ifup.
+heal_wan() {
+    now=$(date +%s); last=$(cat "$HEAL_STAMP" 2>/dev/null); last=${last:-0}
+    [ $((now - last)) -ge "$HEAL_INTERVAL" ] || return 0
+    printf '%s' "$now" > "$HEAL_STAMP"
+    ifup wan
 }
 
 get_state() { cat "$STATE" 2>/dev/null; }
@@ -150,12 +179,23 @@ run_check() {
         case "$(get_state)" in
             proxy)  say_access "online (foreign recovered)" ;;
             campus) say_access "recovered" ;;
+            l2)     say_access "recovered (L2 link back)" ;;
             *)      say_access "online" ;;
         esac
         set_state ok
         return 0
     fi
-    # campus path down: snapshot the fault once, then try to re-login
+    # campus path down: L2/WAN lost (gateway ARP dead) => re-DHCP the WAN; a portal
+    # login cannot fix a dead local link, so don't waste a login round on it.
+    if gw_l2_down; then
+        if [ "$(get_state)" != l2 ]; then
+            say_error "L2 down (gw=$GW arp INCOMPLETE), re-DHCP: ifup wan"
+            set_state l2
+        fi
+        heal_wan
+        return 0
+    fi
+    # campus path down but the link is fine: snapshot the fault once, then re-login
     if [ "$(get_state)" != campus ]; then
         say_error "offline [$(capture_state)]"
         set_state campus
