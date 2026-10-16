@@ -1,11 +1,11 @@
 # 黄河交通学院（ZJTU）校园网自动登录 — OpenWrt 路由版
 
 > 路由器专用套件，主体为 Shell 版，在 OpenWrt / busybox 上运行：
-> **周期检测连通性 → 离线自动重登 → access/error 日志 + logrotate 轮转**。
+> **周期检测连通性 → 离线自动恢复（链路断则重跑 DHCP，掉线则重登门户）→ access/error 日志 + logrotate 轮转**。
 > 定时交给系统 cron（分钟级触发、json 里配检测间隔），开机后自动先检测一次。
 >
 > 另附早期的 Python 登录脚本 `net_login.py`，**保留作参考**；路由器上请用
-> `net_login.sh`。`openwrt` 分支为仅含 Shell 版的精简版。
+> `net_login.sh`。仅含 Shell 版的精简版见 `openwrt` 分支。
 
 ---
 
@@ -34,7 +34,7 @@
 | --- | --- |
 | `net_login.sh` | **登录**脚本（抓表单 → AES 加密 → POST `/gportal/web/authLogin`）。保持纯输出，供检测脚本调用 |
 | `net_login.py` | 早期 Python 版登录脚本，**保留作参考**（不参与路由器套件） |
-| `net_watch.sh` | **检测**主脚本：HTTP 204 探测判离线（ICMP 不可靠，见下文）→ 调 `net_login.sh` → 写日志 |
+| `net_watch.sh` | **检测/自愈**主脚本：HTTP 204 探测判离线（ICMP 不可靠，见下文）→ 网关 ARP 死则 `ifup wan` 重跑 DHCP、链路正常则调 `net_login.sh` 重登 → 写日志 |
 | `net_switch.sh` | **日常开关**：回校 `on` / 放假 `off` / `status`，只启停检测 cron 与开机自启 |
 | `config.json` | 配置（账号密码 + 检测间隔 + 日志/连通目标）。**为示例占位，需填入真实账号** |
 | `install.sh` | 一次性部署 / 状态查看 / 卸载 |
@@ -185,6 +185,7 @@ sh /root/net_login/net_switch.sh status
   "TRYTIME_MAX": 3,
   "TIMEOUT": 3,
   "CHECK_INTERVAL": 300,
+  "HEAL_INTERVAL": 600,
   "LOG_DIR": "/var/log/net_login",
   "ERR_LOG_DIR": "/root/net_login/logs",
   "PING_TARGETS": "223.5.5.5 114.114.114.114",
@@ -205,6 +206,7 @@ sh /root/net_login/net_switch.sh status
 | `TRYTIME_MAX` | `3` | 登录失败最大重试次数 |
 | `TIMEOUT` | `3` | 单次网络请求超时（秒） |
 | `CHECK_INTERVAL` | `300` | 检测间隔（**秒**）。cron 每分钟触发一次，内部按此节流，故实际粒度 ≥60s |
+| `HEAL_INTERVAL` | `600` | 判定「链路断（网关 ARP 死）」后重跑 DHCP（`ifup wan`）的最小间隔（**秒**）。恢复需数分钟，故两次自愈之间至少间隔这么久，避免猛刷 |
 | `LOG_DIR` | `/var/log/net_login` | **access.log** 目录（默认 tmpfs，重启清空） |
 | `ERR_LOG_DIR` | 脚本同目录 `logs/` | **error.log** 目录，**应指向 flash**（如 `/root/net_login/logs`），重启后仍保留历史错误 |
 | `HTTP_CHECK_URLS` | vivo/hicloud 两个 `generate_204` | 空格分隔的**在线判据**：任一返回 `HTTP_CHECK_CODE` 即视为在线。走 DIRECT，测的是校园真实数据面，**不用 ICMP**（见下方说明） |
@@ -240,9 +242,11 @@ sh /root/net_login/net_switch.sh status
 ```
 2026-09-10 08:00:00 INFO  online
 2026-09-10 08:05:00 INFO  recovered
-2026-09-10 08:06:00 ERROR offline [ping: 223.5.5.5=no 114.114.114.114=no cn_http=000 foreign_http=000 portal_http=000]
-2026-09-10 08:07:00 ERROR foreign path down (domestic ok) [ping: 223.5.5.5=ok cn_http=204 foreign_http=000 portal_http=403]
-2026-09-10 08:08:00 ERROR login failed rc=1: [3/3] login failed: 账号或密码错误
+2026-09-10 08:06:00 ERROR L2 down (gw=10.20.1.1 arp INCOMPLETE), re-DHCP: ifup wan
+2026-09-10 08:12:00 INFO  recovered (L2 link back)
+2026-09-10 08:20:00 ERROR offline [ping: 223.5.5.5=no 114.114.114.114=no cn_http=000 foreign_http=000 portal_http=000]
+2026-09-10 08:21:00 ERROR foreign path down (domestic ok) [ping: 223.5.5.5=ok cn_http=204 foreign_http=000 portal_http=403]
+2026-09-10 08:22:00 ERROR login failed rc=1: [3/3] login failed: 账号或密码错误
 ```
 
 > **离线快照**：`offline [...]` 那一行是现场证据，用来一眼分清是谁挂了——
@@ -299,10 +303,10 @@ ls /var/log/net_login/ /root/net_login/logs/    # 看到 .1 / .1.gz 即已轮转
 | error.log 出现 `操作过于频繁/请求过快` | 门户限流约 5s，勿高频触发；已内置重试间隔 |
 | error.log 出现 `offline [cn_http=000 ...]` 但门户页能打开 | 探测 URL 被你这的网络拦了。换 `HTTP_CHECK_URLS` 成可达的国内 204 地址，或把 `HTTP_CHECK_CODE` 调成实际返回码 |
 | error.log 反复 `foreign path down (domestic ok)` | 校园好、**代理/节点挂了**：这是机场问题，不是脚本。去 OpenClash 换节点，或把兜底规则从手动 `select` 组改到 `fallback`/`url-test` 组以自动切换 |
+| error.log 出现 `L2 down (... arp INCOMPLETE), re-DHCP: ifup wan` | 校园**接入层丢二层**（网关不再应答 ARP，多在凌晨），脚本已自动 `ifup wan` 重跑 DHCP 自愈，**无需再手动重启路由器**；号变 `recovered (L2 link back)` 即恢复。若长期频繁，属校园侧问题，可找网络中心 |
 | access.log 一直 `online` 但断网没重登 | 旧版用 ping 判在线才会有此问题；现版用 HTTP 204 判据，若仍复现请检查 `HTTP_CHECK_URLS` 是否被劫持 |
 | access.log 无新行 | 检查 cron 是否启用（`/etc/init.d/cron start`）、`/etc/crontabs/root` 是否有条目、手动跑一次看报错 |
 | 想区分设备/校园/代理故障 | 直接看 error.log 的 `offline [...]` 快照：`cn_http` 正常而 `foreign_http=000` → 代理；`cn_http` 异常 → 校园；全 000 且 ping 全 no → WAN |
-| access.log 无新行 | 检查 cron 是否启用（`/etc/init.d/cron start`）、`/etc/crontabs/root` 是否有条目、手动跑一次看报错 |
 | 忘了检测开没开 | `sh /root/net_login/net_switch.sh status` 看 cron/自启/最近日志（state ON/OFF） |
 | 想确认关闭后什么都不跑 | `net_switch.sh off` 已移除 cron 与自启并终止在跑的检测；`status` 显示 `OFF` 即为空 |
 | 「已在线」却不触发重登 | net_login.sh 若页面无登录表单会视为已在线直接返回，属预期保护，避免重复认证 |
@@ -319,10 +323,15 @@ ls /var/log/net_login/ /root/net_login/logs/    # 看到 .1 / .1.gz 即已轮转
 - **开机首检**：`/etc/init.d/net_watch`（`START=99`）开机即执行 `once`；时间戳存
   `/tmp`（重启清零），即便 init 未触发，重启后第一次 cron 也必然补检。
 - **防重入**：锁文件存 PID，检测过程超过 1 分钟时下一 tick 会跳过，不重复登录。
-- **判定**：逐个请求 `HTTP_CHECK_URLS`（国内、DIRECT），任一返回 `HTTP_CHECK_CODE` 即在线；
-  全不匹配视为离线 → 记录一行快照（`offline [...]`）后调 `net_login.sh` 一次（其内部自带
-  重试与「已在线则免登」判断）。若配置了 `FOREIGN_CHECK_URL`，国内通而它不通则记为
-  `foreign path down`（代理侧），**不触登录**，仅留证据。
+- **判定与自愈**：逐个请求 `HTTP_CHECK_URLS`（国内、DIRECT），任一返回 `HTTP_CHECK_CODE`
+  即在线；全不匹配视为离线。离线时按链路状态分两种：
+  - **链路断**：默认网关的 ARP 为 `INCOMPLETE`/`FAILED`（校园接入层不再应答 ARP，本地二层
+    已断）→ 记 `L2 down` 并执行 `ifup wan` 重跑 DHCP（两次之间至少隔 `HEAL_INTERVAL` 秒，
+    因恢复需数分钟）。链路死时门户登录必然失败，故**不**调登录。
+  - **链路正常**（校园 de-auth）：记一行快照（`offline [...]`）后调 `net_login.sh` 一次
+    （其内部自带重试与「已在线则免登」判断）。
+  - 若配置了 `FOREIGN_CHECK_URL`，国内通而它不通则记为 `foreign path down`（代理侧），
+    **不触登录**，仅留证据。
 
 ---
 

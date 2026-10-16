@@ -6,6 +6,7 @@
   "TRYTIME_MAX": 3,
   "TIMEOUT": 3,
   "CHECK_INTERVAL": 300,
+  "HEAL_INTERVAL": 600,
   "LOG_DIR": "/var/log/net_login",
   "ERR_LOG_DIR": "/root/net_login/logs",
   "PING_TARGETS": "223.5.5.5 114.114.114.114",
