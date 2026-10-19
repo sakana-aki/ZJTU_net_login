@@ -12,16 +12,15 @@ DEST=$(cd "$(dirname "$0")" && pwd)
 CONF="$DEST/config.json"
 CRONTAB=${CRONTAB:-/etc/crontabs/root}
 INIT=${INIT:-/etc/init.d/net_watch}
-LOG_DIR_DEFAULT=/var/log/net_login
+LOG_DIR_DEFAULT="$DEST/logs"
 
 cfg_get() {
     sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"*\([^\",}]*\)\"*.*/\1/p" "$CONF" | head -n 1
 }
 
 LOG_DIR=$(cfg_get LOG_DIR); [ -z "$LOG_DIR" ] && LOG_DIR=$LOG_DIR_DEFAULT
-ERR_LOG_DIR=$(cfg_get ERR_LOG_DIR); [ -z "$ERR_LOG_DIR" ] && ERR_LOG_DIR="$DEST/logs"
 ACCESS="$LOG_DIR/access.log"
-ERROR="$ERR_LOG_DIR/error.log"
+ERROR="$LOG_DIR/error.log"
 
 info() { printf '[net_switch] %s\n' "$@"; }
 die()  { printf '[net_switch][ERROR] %s\n' "$@"; exit 1; }
@@ -37,7 +36,7 @@ log_trace() {
     printf '%s INFO  net_switch: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$ACCESS" 2>/dev/null
 }
 
-cron_line="* * * * * PATH=/usr/bin:/bin $DEST/net_watch.sh cron"
+cron_line="* * * * * PATH=/usr/sbin:/usr/bin:/sbin:/bin $DEST/net_watch.sh cron"
 
 # idempotent add/remove of our cron entry (matched by marker comment, other entries untouched)
 add_cron() {
@@ -122,14 +121,14 @@ do_status() {
     echo "  cron entry   : $([ "$cron_on" -ge 1 ] && echo yes || echo no)"
     echo "  boot autostart: $([ "$init_on" -eq 1 ] && echo yes || echo no)"
     echo "  logrotate cfg: $([ -f /etc/logrotate.d/net_login ] && echo present || echo none)"
-    echo "  recent access.log ($LOG_DIR/access.log, tmpfs):"
+    echo "  recent access.log ($LOG_DIR/access.log, flash):"
     tail -n 6 "$ACCESS" 2>/dev/null || echo "    (no access.log yet; run: $DEST/net_watch.sh once)"
-    echo "  recent error.log ($ERROR, flash):"
+    echo "  recent error.log ($ERROR):"
     tail -n 6 "$ERROR" 2>/dev/null || echo "    (no error.log yet — good sign; created on first failure)"
 }
 
 do_help() {
-    sed -n '1,12p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
     echo "  subcommands: on(start/enable) / off(stop/disable) / status / help"
 }
 

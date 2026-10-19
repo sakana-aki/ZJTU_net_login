@@ -6,14 +6,13 @@
 #   sh install.sh uninstall  # remove what this script wrote (keeps scripts & logs)
 #   sh install.sh help
 #
-# deps: curl, openssl-util (login), logrotate (log rotation), jq (optional, config check)
+# deps: curl, openssl-util (login), logrotate (log rotation); jq optional (config check)
 # missing ones are auto-installed via opkg; non-OpenWrt (no opkg) prints a hint instead.
 set -u
 DEST=$(cd "$(dirname "$0")" && pwd)
 CONF="$DEST/config.json"
 CRONTAB=/etc/crontabs/root
-LOG_DIR_DEFAULT=/var/log/net_login
-ERR_LOG_DIR_DEFAULT="$DEST/logs"
+LOG_DIR_DEFAULT="$DEST/logs"
 
 cfg_get() {
     sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"*\([^\",}]*\)\"*.*/\1/p" "$CONF" | head -n 1
@@ -35,17 +34,15 @@ need_files() {
 }
 
 # ---------- dependency check / install ----------
-pkg_missing() { command -v "$1" >/dev/null 2>&1 || return 0; return 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
 ensure_deps() {
     missing_list=""
-    for pair in "curl:curl" "openssl:openssl-util" "logrotate:logrotate" "jq:jq"; do
+    for pair in "curl:curl" "openssl:openssl-util" "logrotate:logrotate"; do
         bin=${pair%%:*}; pkg=${pair#*:}
-        if pkg_missing "$bin"; then
-            missing_list="$missing_list $pkg"
-        fi
+        have "$bin" || missing_list="$missing_list $pkg"
     done
-    [ -z "$missing_list" ] && { info "deps ok (curl openssl-util logrotate jq)"; return 0; }
+    [ -z "$missing_list" ] && { info "deps ok (curl openssl-util logrotate)"; return 0; }
 
     if command -v opkg >/dev/null 2>&1; then
         info "installing missing packages via opkg:$missing_list"
@@ -53,39 +50,44 @@ ensure_deps() {
         # shellcheck disable=SC2086
         opkg install $missing_list || die "opkg install failed, install manually:$missing_list"
     else
-        warn "no opkg (non-OpenWrt). make sure these exist: curl openssl jq logrotate"
+        warn "no opkg (non-OpenWrt). make sure these exist: curl openssl logrotate"
     fi
 }
 
-# ---------- logrotate (access: size 500k; error: daily keep 3, yesterday uncompressed) ----------
+# jq is optional: when present, catch a malformed config before it silently
+# turns every cfg_get into an empty value.
+check_config() {
+    if command -v jq >/dev/null 2>&1; then
+        jq empty "$CONF" >/dev/null 2>&1 || die "config.json is not valid JSON"
+        info "config.json syntax ok"
+    fi
+}
+
+# ---------- logrotate (access: daily, keep 2; error: daily, keep 3 with delaycompress) ----------
 write_logrotate() {
     LOG_DIR=$(cfg_get LOG_DIR)
     [ -z "$LOG_DIR" ] && LOG_DIR=$LOG_DIR_DEFAULT
-    ERR_LOG_DIR=$(cfg_get ERR_LOG_DIR)
-    [ -z "$ERR_LOG_DIR" ] && ERR_LOG_DIR=$ERR_LOG_DIR_DEFAULT
     mkdir -p /etc/logrotate.d
     cat > /etc/logrotate.d/net_login <<EOF
-# campus-net_login logs (rotated via rename+create, no full copy)
-# access.log: tmpfs (volatile); error.log: on flash (survives reboot)
+# campus-net_login logs: access daily (current + yesterday); error current + .1 + .2.gz.
 $LOG_DIR/access.log {
-    size 500k
-    rotate 2
-    compress
+    daily
+    rotate 1
     missingok
     notifempty
     create 0644 root root
 }
-$ERR_LOG_DIR/error.log {
+$LOG_DIR/error.log {
     daily
-    rotate 3
-    delaycompress
+    rotate 2
     compress
+    delaycompress
     missingok
     notifempty
     create 0644 root root
 }
 EOF
-    info "wrote /etc/logrotate.d/net_login (access: size 500k / error: daily x3, delaycompress)"
+    info "wrote /etc/logrotate.d/net_login (access: daily x2; error: daily x3, current+.1+.2.gz)"
 }
 
 # ---------- cron: every-minute detection (net_watch throttles to json interval) ----------
@@ -94,7 +96,7 @@ add_cron_watch() {
     sed -i '/^# net_login:watch$/d;/net_watch.sh cron/d' "$CRONTAB" 2>/dev/null
     {
         echo '# net_login:watch'
-        echo "* * * * * PATH=/usr/bin:/bin $DEST/net_watch.sh cron"
+        echo "* * * * * PATH=/usr/sbin:/usr/bin:/sbin:/bin $DEST/net_watch.sh cron"
     } >> "$CRONTAB"
     info "added minute-detection cron -> $CRONTAB"
 }
@@ -142,22 +144,22 @@ EOF
     fi
 }
 
-# ---------- log dirs: access on tmpfs, error on flash (create so it's tail-able now) ----------
+# ---------- log dir: access.log + error.log share LOG_DIR ----------
 init_logs() {
     LOG_DIR=$(cfg_get LOG_DIR)
     [ -z "$LOG_DIR" ] && LOG_DIR=$LOG_DIR_DEFAULT
-    ERR_LOG_DIR=$(cfg_get ERR_LOG_DIR)
-    [ -z "$ERR_LOG_DIR" ] && ERR_LOG_DIR=$ERR_LOG_DIR_DEFAULT
-    mkdir -p "$LOG_DIR" "$ERR_LOG_DIR" 2>/dev/null
+    mkdir -p "$LOG_DIR" 2>/dev/null
     # create if missing without truncating an existing log (`: >>` appends nothing)
-    : >> "$ERR_LOG_DIR/error.log" 2>/dev/null
-    info "log dirs: access=$LOG_DIR (tmpfs) / error=$ERR_LOG_DIR (flash)"
+    : >> "$LOG_DIR/access.log" 2>/dev/null
+    : >> "$LOG_DIR/error.log" 2>/dev/null
+    info "log dir: $LOG_DIR (access.log + error.log)"
 }
 
 # ---------- actions ----------
 do_install() {
     need_root
     need_files
+    check_config
     warn_if_placeholder
     ensure_deps
     init_logs
@@ -170,8 +172,8 @@ do_install() {
     info "install done, running one check now:"
     "$DEST/net_watch.sh" once || echo "[install] check/login did not pass (offline or no real account), see logs above"
     echo
-    echo "  logs:    tail -f $LOG_DIR/access.log        # access (tmpfs)"
-    echo "           tail -f $ERR_LOG_DIR/error.log      # errors (flash)"
+    echo "  logs:    tail -f $LOG_DIR/access.log"
+    echo "           tail -f $LOG_DIR/error.log"
     echo "  inspect: sh $DEST/install.sh status"
 }
 
@@ -195,14 +197,13 @@ do_status() {
     else
         echo "(no /etc/init.d/net_watch)"
     fi
-    echo; echo "== cron =="; grep -E 'net_login|net_watch|logrotate' "$CRONTAB" 2>/dev/null || echo "(none)"
+    echo; echo "== cron =="; grep -e net_login -e net_watch -e logrotate "$CRONTAB" 2>/dev/null || echo "(none)"
     echo; echo "== logrotate =="; [ -f /etc/logrotate.d/net_login ] && cat /etc/logrotate.d/net_login || echo "(no /etc/logrotate.d/net_login)"
     LOG_DIR=$(cfg_get LOG_DIR); [ -z "$LOG_DIR" ] && LOG_DIR=$LOG_DIR_DEFAULT
-    ERR_LOG_DIR=$(cfg_get ERR_LOG_DIR); [ -z "$ERR_LOG_DIR" ] && ERR_LOG_DIR=$ERR_LOG_DIR_DEFAULT
-    echo; echo "== logs (access: $LOG_DIR tmpfs | error: $ERR_LOG_DIR flash) =="
-    ls -l "$LOG_DIR" "$ERR_LOG_DIR" 2>/dev/null || echo "(no logs yet, run once: $DEST/net_watch.sh once)"
-    [ -f "$LOG_DIR/access.log" ]     && { echo "--- access.log last 10 ---"; tail -n 10 "$LOG_DIR/access.log"; }
-    [ -f "$ERR_LOG_DIR/error.log" ]  && { echo "--- error.log last 10 ---"; tail -n 10 "$ERR_LOG_DIR/error.log"; }
+    echo; echo "== logs ($LOG_DIR) =="
+    ls -l "$LOG_DIR" 2>/dev/null || echo "(no logs yet, run once: $DEST/net_watch.sh once)"
+    [ -f "$LOG_DIR/access.log" ] && { echo "--- access.log last 10 ---"; tail -n 10 "$LOG_DIR/access.log"; }
+    [ -f "$LOG_DIR/error.log" ]  && { echo "--- error.log last 10 ---"; tail -n 10 "$LOG_DIR/error.log"; }
 }
 
 do_uninstall() {
@@ -212,7 +213,11 @@ do_uninstall() {
         rm -f /etc/init.d/net_watch
         info "removed boot item /etc/init.d/net_watch"
     fi
-    sed -i '/^# net_login:watch$/d;/net_watch.sh cron/d;/^# net_login:logrotate$/d' "$CRONTAB" 2>/dev/null
+    sed -i '/^# net_login:watch$/d;/net_watch.sh cron/d' "$CRONTAB" 2>/dev/null
+    # remove the logrotate schedule only if we added it (marked by our comment)
+    if grep -qF '# net_login:logrotate' "$CRONTAB" 2>/dev/null; then
+        sed -i '/^# net_login:logrotate$/d;/logrotate \/etc\/logrotate.conf/d' "$CRONTAB" 2>/dev/null
+    fi
     info "removed suite cron entries from $CRONTAB"
     [ -f /etc/logrotate.d/net_login ] && { rm -f /etc/logrotate.d/net_login; info "removed /etc/logrotate.d/net_login"; }
     echo
@@ -220,7 +225,7 @@ do_uninstall() {
 }
 
 do_help() {
-    sed -n '1,12p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
     echo "  subcommands: install(default) / status / uninstall / help"
 }
 

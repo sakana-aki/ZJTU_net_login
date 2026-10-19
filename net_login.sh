@@ -1,5 +1,5 @@
 #!/bin/sh
-# 校园网自动登录（纯 shell，busybox/OpenWrt 与桌面 Linux 通用，无第三方依赖）
+# 校园网自动登录（纯 shell，busybox/OpenWrt 与桌面 Linux 通用，仅依赖 curl + openssl）
 #
 # 协议：抓登录页拿隐藏字段(sign/iv 等) -> 表单序列化成 query string
 #       -> AES-128-CBC(ZeroPadding) 加密 -> base64 -> POST /gportal/web/authLogin
@@ -70,7 +70,7 @@ deesc() {
                 t)  printf '\t' ;;
                 '"') printf '"' ;;
                 '\') printf '\' ;;
-                *)  printf '\' ; printf '%s' "$c" ;;
+                *)  printf '%s' '\' ; printf '%s' "$c" ;;
             esac
         else
             printf '%s' "$c"
@@ -110,10 +110,12 @@ build_qs() {
 
 # 返回码：0=已得到服务器结果(经 stdout 返回 OK:/FAIL:)，1=网络/页面出错，2=页面无表单(视为已在线)
 do_login() {
-    curl -sS -m "$TIMEOUT" -A "$UA" -c "$COOKIE" -b "$COOKIE" -o "$LOGIN_HTML" "$LOGIN_URL" || return 1
+    curl -sS -m "$TIMEOUT" --noproxy '*' -A "$UA" \
+        -c "$COOKIE" -b "$COOKIE" -o "$LOGIN_HTML" "$LOGIN_URL" || return 1
     grep -q frmLogin "$LOGIN_HTML" || { echo "no login form frmLogin: already online or portal changed"; return 2; }
 
     iv=$(html_field iv)
+    [ -n "$iv" ] || { echo "no iv field in login page"; return 1; }
     qs=$(build_qs)
 
     # AES 前要把 key/iv 的"ASCII 字节"转 hex 喂给 openssl。
@@ -129,7 +131,7 @@ do_login() {
            | openssl base64 -A | tr -d '\n')
 
     auth_url=$(printf '%s' "$LOGIN_URL" | sed 's|/login$|/authLogin|')
-    curl -sS -m "$TIMEOUT" -A "$UA" -b "$COOKIE" -c "$COOKIE" \
+    curl -sS -m "$TIMEOUT" --noproxy '*' -A "$UA" -b "$COOKIE" -c "$COOKIE" \
         -H "Referer: $LOGIN_URL" \
         -H "Accept: application/json, text/javascript, */*; q=0.01" \
         --data-urlencode "data=$data" --data-urlencode "iv=$iv" \
