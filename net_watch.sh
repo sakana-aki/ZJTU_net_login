@@ -1,11 +1,14 @@
 #!/bin/sh
+# version: 1.1.0
 # campus-net watchdog: detect connectivity, auto-recover if offline (OpenWrt/busybox).
 # Online == a domestic HTTP 204 succeeds (real data path). Two offline modes are handled:
 #   - link/DHCP/auth path broken (no default route, dead gateway ARP, or the portal
 #     itself unreachable): re-DHCP the WAN via `ifup wan` (throttled by HEAL_INTERVAL)
-#     — a portal login cannot fix a dead local link;
+#     — a portal login cannot fix a dead local link; the `ifup` triggers a full fw3
+#     reload, so OpenClash's transparent-proxy chain is restored right afterwards;
 #   - link fine and portal reachable but de-authed: re-login (net_login.sh).
-# A dead proxy path and the campus state at each outage are recorded to error.log.
+# The campus state at each outage is recorded to error.log; the proxy path is
+# intentionally not probed or logged.
 # Called by cron every minute (internally throttled to CHECK_INTERVAL); boot runs "once".
 # Logs (English, compact): both access.log and error.log live in LOG_DIR (flash on
 # OpenWrt, so they survive reboot); both rotated via logrotate.
@@ -40,13 +43,10 @@ HTTP_CHECK_URLS=$(cfg_get HTTP_CHECK_URLS)
 [ -z "$HTTP_CHECK_URLS" ] && HTTP_CHECK_URLS="http://wifi.vivo.com.cn/generate_204 http://connectivitycheck.platform.hicloud.com/generate_204"
 HTTP_CHECK_CODE=$(cfg_get HTTP_CHECK_CODE); [ -z "$HTTP_CHECK_CODE" ] && HTTP_CHECK_CODE=204
 HTTP_TIMEOUT=$(cfg_get HTTP_TIMEOUT);       [ -z "$HTTP_TIMEOUT" ]   && HTTP_TIMEOUT=5
-# Optional proxied probe to tell a dead proxy apart from a dead campus link.
-# Empty => skipped (only useful when a proxy/OpenClash is in front of foreign traffic).
-FOREIGN_CHECK_URL=$(cfg_get FOREIGN_CHECK_URL)
 
 # stamp in /tmp: cleared on reboot => first cron after boot always checks
 STAMP="${TMPDIR:-/tmp}/.net_login.last"
-STATE="${TMPDIR:-/tmp}/.net_login.state"   # last verdict: ok|proxy|campus|l2
+STATE="${TMPDIR:-/tmp}/.net_login.state"   # last verdict: ok|campus|l2
 ERR_STATE="${TMPDIR:-/tmp}/.net_error.state"  # last throttled error: epoch\nmessage
 HEAL_STAMP="${TMPDIR:-/tmp}/.net_heal.last"  # last time we re-DHCP'd the WAN
 HEAL_INTERVAL=$(cfg_get HEAL_INTERVAL); [ -z "$HEAL_INTERVAL" ] && HEAL_INTERVAL=600
@@ -91,15 +91,6 @@ online_domestic() {
     return 1
 }
 
-# foreign/proxy path: only meaningful when FOREIGN_CHECK_URL is set; otherwise
-# assume ok so a proxyless deployment never logs proxy noise
-online_foreign() {
-    [ -n "$FOREIGN_CHECK_URL" ] || return 0
-    command -v curl >/dev/null 2>&1 || return 0
-    [ "$(http_code "$FOREIGN_CHECK_URL")" = "$HTTP_CHECK_CODE" ] && return 0
-    return 1
-}
-
 # default IPv4 gateway of the WAN link (empty if none)
 default_gw() { ip route 2>/dev/null | sed -n 's/^default via \([0-9.]*\).*/\1/p' | head -n 1; }
 
@@ -128,6 +119,27 @@ portal_code() {
     http_code "$ph"
 }
 
+# `ifup wan` makes fw3 reload every rule, which also flushes rules that services
+# add to PREROUTING. OpenClash normally restores its transparent-proxy chain from
+# /var/etc/openclash.include, but that hook rate-limits itself (10 reloads / 5 min)
+# and then silently skips, leaving LAN clients unable to reach anything proxied.
+# Put the jump back after a heal if it is gone; no-op without OpenClash.
+restore_proxy_fw() {
+    [ -x /etc/init.d/openclash ] || return 0
+    [ "$(uci -q get openclash.config.enable 2>/dev/null)" = "1" ] || return 0
+    command -v iptables >/dev/null 2>&1 || return 0
+    iptables -t nat -S PREROUTING >/dev/null 2>&1 || return 0
+    # ifup is asynchronous: let netifd finish and fw3 run its reload first
+    sleep 8
+    iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- '-j openclash' && return 0
+    /etc/init.d/openclash reload manual >/dev/null 2>&1
+    if iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- '-j openclash'; then
+        say_access "restore: OpenClash firewall rules reloaded"
+    else
+        say_error "restore failed: OpenClash firewall rules still missing"
+    fi
+}
+
 # Re-DHCP the WAN, throttled: recovery is not instant (DHCP + re-auth takes a few
 # minutes), so back off HEAL_INTERVAL between attempts instead of hammering ifup.
 heal_wan() {
@@ -142,6 +154,7 @@ heal_wan() {
     else
         say_access "re-DHCP: ifup wan"
     fi
+    restore_proxy_fw
 }
 
 get_state() { cat "$STATE" 2>/dev/null; }
@@ -176,7 +189,7 @@ say_error_throttled() {
 }
 
 # one-line forensics so the next outage can be classified (campus de-auth vs
-# dead proxy vs dead WAN) instead of guessed
+# dead WAN) instead of guessed
 capture_state() {
     s=""
     for t in $PING_TARGETS; do
@@ -184,12 +197,9 @@ capture_state() {
     done
     gw=$(default_gw); arp=none
     [ -n "$gw" ] && arp=$(neigh_state "$gw")
-    fh=n/a
-    [ -n "$FOREIGN_CHECK_URL" ] && fh=$(http_code "$FOREIGN_CHECK_URL")
-    printf 'ping:%s cn_http=%s foreign_http=%s portal_http=%s gw=%s arp=%s' \
+    printf 'ping:%s cn_http=%s portal_http=%s gw=%s arp=%s' \
         "$s" \
         "$(http_code "$(printf '%s' "$HTTP_CHECK_URLS" | cut -d' ' -f1)")" \
-        "$fh" \
         "$(portal_code)" \
         "${gw:-none}" "$arp"
 }
@@ -223,16 +233,7 @@ last_line() {
 
 run_check() {
     if online_domestic; then
-        if ! online_foreign; then
-            # campus is fine, only the proxy/foreign path is dead: record once, no login
-            if [ "$(get_state)" != proxy ]; then
-                say_error "foreign path down (domestic ok) [$(capture_state)]"
-                set_state proxy
-            fi
-            return 0
-        fi
         case "$(get_state)" in
-            proxy)  say_access "online (foreign recovered)" ;;
             campus) say_access "recovered" ;;
             l2)     say_access "recovered (L2 link back)" ;;
             *)      say_access "online" ;;
@@ -266,7 +267,10 @@ run_check() {
     out=$("$LOGIN_SH" 2>&1)
     rc=$?
     if [ "$rc" -eq 0 ]; then
-        say_access "recovered"
+        case "$out" in
+            *"rebind ok"*) say_access "recovered (device rebound)" ;;
+            *)             say_access "recovered" ;;
+        esac
         set_state ok
     else
         last=$(last_line "$out")

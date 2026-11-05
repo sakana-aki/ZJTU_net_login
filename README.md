@@ -5,8 +5,9 @@
 
 登录为纯 Shell 实现，不依赖 Python。协议：抓取登录页隐藏字段 →
 AES-128-CBC（ZeroPadding）加密 → POST `/gportal/web/authLogin`。
+若门户返回 `reasoncode=43`（账号已绑定其他设备），默认自动重绑当前设备后再登录。
 
-> `net_login.py` 是早期 Python 参考实现，不参与路由器套件。
+> 当前版本：v1.1.0 ｜ `net_login.py` 是早期 Python 参考实现，不参与路由器套件。
 
 ## 免责声明
 
@@ -20,7 +21,7 @@ AES-128-CBC（ZeroPadding）加密 → POST `/gportal/web/authLogin`。
 
 | 文件 | 作用 |
 | --- | --- |
-| `net_login.sh` | 登录脚本：抓表单 → AES 加密 → 提交认证 |
+| `net_login.sh` | 登录脚本：抓表单 → AES 加密 → 提交认证；遇 `reasoncode=43` 自动重绑设备 |
 | `net_watch.sh` | 检测 / 自愈：HTTP 204 判在线，掉认证重登，链路异常时重跑 DHCP |
 | `net_switch.sh` | 日常开关：回校 `on`、放假 `off`、`status` 查看 |
 | `install.sh` | 一键安装 / 状态 / 卸载 |
@@ -68,6 +69,7 @@ sh net_switch.sh status   # 查看当前状态与最近日志
   "AES_KEY": "1234567887654321",
   "TRYTIME_MAX": 3,
   "TIMEOUT": 3,
+  "REBIND": 1,
   "CHECK_INTERVAL": 300,
   "ERROR_REPEAT_INTERVAL": 3600,
   "HEAL_INTERVAL": 600,
@@ -77,8 +79,7 @@ sh net_switch.sh status   # 查看当前状态与最近日志
   "PING_WAIT": 2,
   "HTTP_CHECK_URLS": "http://wifi.vivo.com.cn/generate_204 http://connectivitycheck.platform.hicloud.com/generate_204",
   "HTTP_CHECK_CODE": 204,
-  "HTTP_TIMEOUT": 5,
-  "FOREIGN_CHECK_URL": ""
+  "HTTP_TIMEOUT": 5
 }
 ```
 
@@ -89,6 +90,7 @@ sh net_switch.sh status   # 查看当前状态与最近日志
 | `AES_KEY` | `1234567887654321` | 门户前端固定密钥，一般勿改 |
 | `TRYTIME_MAX` | `3` | 登录失败重试次数 |
 | `TIMEOUT` | `3` | 单次请求超时（秒） |
+| `REBIND` | `1` | 遇 `reasoncode=43`（已绑定其他设备）时自动重绑当前设备；`0` 关闭 |
 | `CHECK_INTERVAL` | `300` | 检测间隔（秒）。cron 每分钟触发，内部按此节流 |
 | `ERROR_REPEAT_INTERVAL` | `3600` | 同一故障写 error.log 的抑制窗口（秒） |
 | `HEAL_INTERVAL` | `600` | 两次 `ifup wan` 自愈之间的最小间隔（秒） |
@@ -96,7 +98,6 @@ sh net_switch.sh status   # 查看当前状态与最近日志
 | `HTTP_CHECK_URLS` | 国内两个 `generate_204` | 在线判据：任一返回期望状态码即在线 |
 | `HTTP_CHECK_CODE` | `204` | 期望的 HTTP 状态码 |
 | `HTTP_TIMEOUT` | `5` | 单次 HTTP 探测超时（秒） |
-| `FOREIGN_CHECK_URL` | 空（跳过） | 可选境外 204 地址，用于区分「代理挂了」和「校园挂了」 |
 | `PING_TARGETS` / `PING_COUNT` / `PING_WAIT` | 见示例 | 仅用于离线快照与无 curl 时的兜底判据 |
 
 > `config.json` 含账号密码，请勿提交到公开仓库。
@@ -106,7 +107,7 @@ sh net_switch.sh status   # 查看当前状态与最近日志
 两个日志同目录，默认 `/root/net_login/logs`（在 flash 上，重启保留）：
 
 - `access.log`：每次实际检测与恢复动作，如 `online`、`recovered`、`ifup wan`。
-- `error.log`：故障现场、登录失败原因、代理 / 外网异常。
+- `error.log`：故障现场与登录失败原因（不检测、不记录代理 / 机场状态）。
 
 ```sh
 tail -f /root/net_login/logs/access.log
@@ -125,7 +126,7 @@ tail -f /root/net_login/logs/error.log
 | 一直 `login failed: 账号不存在 / 密码错误` | 检查 `config.json` 中的账号密码 |
 | 提示 `操作过于频繁 / 请求过快` | 门户限流约 5 秒，脚本已内置重试间隔，降低触发频率即可 |
 | `access.log` 一直 `online` 但实际断网 | 探测地址可能被网络拦截，换一个可达的国内 204 地址或调整 `HTTP_CHECK_CODE` |
-| 反复出现 `foreign path down (domestic ok)` | 校园网正常、代理节点故障：更换节点或改用自动测速分组 |
+| `login failed: 该账号已绑定过其他同类型设备` | 开启 `REBIND`（默认）后会自动重绑；仍失败可手动登录门户解绑旧设备 |
 | 出现 `link/DHCP down (...), re-DHCP: ifup wan` | 校园接入层异常，脚本已自动重跑 DHCP；状态变为 `recovered` 即恢复 |
 | 日志不再更新 | 检查 cron 是否运行、`/etc/crontabs/root` 是否有检测条目，并手动运行 `net_watch.sh once` 看报错 |
 | 日志时间错乱 | 系统时钟未同步：`ntpd -n -q -p ntp.aliyun.com` |
@@ -137,8 +138,23 @@ tail -f /root/net_login/logs/error.log
 - 在线判据是国内 HTTP 204，而不是 ICMP——认证失效时 ICMP 往往仍通。
 - 离线时自动分类：门户不可达 / 无默认路由 / 网关 ARP 失败 → `ifup wan` 重跑 DHCP；
   门户可达但认证失效 → 调用 `net_login.sh` 重新登录。
+- `ifup wan` 会让 fw3 整体重载防火墙，可能冲掉 OpenClash 的透明代理链；脚本在自愈后
+  检测 `-j openclash` 是否还在，缺失时执行 `/etc/init.d/openclash reload manual` 补回
+  （未装 OpenClash 时自动跳过）。
 - 锁文件防止重复执行；运行状态保存在 `/tmp`，重启后第一次检查必然执行。
-- 配置 `FOREIGN_CHECK_URL` 后，可额外区分代理故障与校园网故障。
+- 只关心校园网是否在线：不探测机场 / 代理线路，代理故障不会写日志、也不会触发重登。
+- 登录遇到 `reasoncode=43` 时自动重绑当前设备（路由器每次重启可能换随机 MAC）。
+
+## 更新日志
+
+### v1.1.0（2026-11-05）
+
+- 新增：门户返回 `reasoncode=43`（账号已绑定其他设备）时，自动 POST
+  `/gportal/web/reBindMac` 重绑当前设备并重新登录；`REBIND=0` 可关闭。
+- 新增：`ifup wan` 自愈后检测 OpenClash 透明代理链，被 fw3 重载冲掉时自动补回。
+- 变更：移除机场 / 代理可用性探测，`error.log` 不再出现 `foreign path down` 记录；
+  同时删除 `FOREIGN_CHECK_URL` 配置项。
+- 变更：`access.log` 中设备重绑成功单独记录为 `recovered (device rebound)`。
 
 ## License
 

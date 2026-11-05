@@ -1,8 +1,11 @@
 #!/bin/sh
+# version: 1.1.0
 # 校园网自动登录（纯 shell，busybox/OpenWrt 与桌面 Linux 通用，仅依赖 curl + openssl）
 #
 # 协议：抓登录页拿隐藏字段(sign/iv 等) -> 表单序列化成 query string
 #       -> AES-128-CBC(ZeroPadding) 加密 -> base64 -> POST /gportal/web/authLogin
+#       若服务端返回 reasoncode=43（账号已绑定其他设备），默认自动 POST /gportal/web/reBindMac
+#       重绑到当前设备后再登录一次；设 REBIND=0 可关闭自动重绑。
 #
 # 运行依赖：curl、openssl（enc 加密 + base64 编码；OpenWrt: opkg install curl openssl-util）
 # 其余只用 busybox/GNU 都带的基础工具：sed grep tr printf dd
@@ -25,6 +28,8 @@ TRYTIME_MAX=$(cfg_get TRYTIME_MAX)
 [ -z "$TRYTIME_MAX" ] && TRYTIME_MAX=1
 TIMEOUT=$(cfg_get TIMEOUT)
 [ -z "$TIMEOUT" ] && TIMEOUT=3
+REBIND=$(cfg_get REBIND)
+[ -z "$REBIND" ] && REBIND=1
 
 # 等价于 JS 的 encodeURIComponent。注：省略了 '!()* 这些不会出现的字符——
 # 百分号编码可逆，服务端解密后再统一解码，得到的是同一份字段值。
@@ -97,56 +102,133 @@ html_field() {
     sed -n "s/.*name=\"$1\"[^>]*value=\"\([^\"]*\)\".*/\1/p" "$LOGIN_HTML" | head -n 1
 }
 
-# 按固定顺序把表单序列化成 query string（与浏览器/jQuery 一致）
+# 从响应 JSON 取数字/裸值字段
+resp_num() {
+    sed -n "s/.*\"$1\":[[:space:]]*\"*\([0-9]*\)\"*.*/\1/p" "$RESP" | head -n 1
+}
+
+# 从响应 JSON 取字符串字段
+resp_str() {
+    sed -n "s/.*\"$1\":[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$RESP" | head -n 1
+}
+
+# 取响应 info 并去掉 JSON 转义与首尾空白
+resp_info() {
+    v=$(deesc "$(resp_str info)")
+    printf '%s' "$v" | tr '\n\r' '  ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+# 按固定顺序把表单序列化成 query string（与浏览器/jQuery 一致）。
+# 可选参数 $1：非空时覆盖 userMac（重绑定流程用服务端返回的 bindmac）。
 build_qs() {
+    mac_override=$1
     qs=
     for f in nasName nasIp userIp userMac ssid apMac pid vlan sign iv is_mobile; do
-        v=$(html_field "$f")
+        if [ "$f" = userMac ] && [ -n "$mac_override" ]; then
+            v=$mac_override
+        else
+            v=$(html_field "$f")
+        fi
         qs="${qs:+$qs&}$(urlencode "$f")=$(urlencode "$v")"
     done
     qs="${qs}&$(urlencode name)=$(urlencode "$USERID")&$(urlencode password)=$(urlencode "$PASSWD")"
     printf '%s' "$qs"
 }
 
-# 返回码：0=已得到服务器结果(经 stdout 返回 OK:/FAIL:)，1=网络/页面出错，2=页面无表单(视为已在线)
-do_login() {
+# AES-128-CBC + ZeroPadding，输出单行 base64；$1=明文 query string，$2=iv
+encrypt_qs() {
+    eqs=$1 eiv=$2
+    KEY_HEX=$(hex_ascii "$AES_KEY")
+    IV_HEX=$(hex_ascii "$eiv")
+    # ZeroPadding：openssl 默认是 PKCS7，需 -nopad + 手工补 0x00；明文整块时也要补满一块
+    len=$(printf '%s' "$eqs" | wc -c)
+    pad=$((16 - len % 16))
+    { printf '%s' "$eqs"; dd if=/dev/zero bs=1 count="$pad" 2>/dev/null; } \
+        | openssl enc -aes-128-cbc -e -nopad -K "$KEY_HEX" -iv "$IV_HEX" \
+        | openssl base64 -A | tr -d '\n'
+}
+
+# 抓登录页，成功则设置全局 iv；返回 0=有表单，1=请求出错，2=无表单(已在线)
+fetch_page() {
     curl -sS -m "$TIMEOUT" --noproxy '*' -A "$UA" \
         -c "$COOKIE" -b "$COOKIE" -o "$LOGIN_HTML" "$LOGIN_URL" || return 1
-    grep -q frmLogin "$LOGIN_HTML" || { echo "no login form frmLogin: already online or portal changed"; return 2; }
-
+    grep -q frmLogin "$LOGIN_HTML" || return 2
     iv=$(html_field iv)
-    [ -n "$iv" ] || { echo "no iv field in login page"; return 1; }
-    qs=$(build_qs)
+    [ -n "$iv" ] || return 1
+    return 0
+}
 
-    # AES 前要把 key/iv 的"ASCII 字节"转 hex 喂给 openssl。
-    # 页面 iv 如 ff4bf146fa787de3 是 16 个字符当 UTF-8 字节用，不是十六进制解码。
-    KEY_HEX=$(hex_ascii "$AES_KEY")
-    IV_HEX=$(hex_ascii "$iv")
-    # ZeroPadding：openssl 默认是 PKCS7，需 -nopad + 手工补 0x00；明文整块时也要补满一块
-    len=$(printf '%s' "$qs" | wc -c)
-    pad=$((16 - len % 16))
-    # 加密输出为二进制，用 openssl base64 -A 单行编码（替代外部 base64）
-    data=$({ printf '%s' "$qs"; dd if=/dev/zero bs=1 count="$pad" 2>/dev/null; } \
-           | openssl enc -aes-128-cbc -e -nopad -K "$KEY_HEX" -iv "$IV_HEX" \
-           | openssl base64 -A | tr -d '\n')
-
-    auth_url=$(printf '%s' "$LOGIN_URL" | sed 's|/login$|/authLogin|')
+# 以 $1=query string、$2=iv 加密后 POST 到 $3，响应写入 $RESP
+post_encrypted() {
+    data=$(encrypt_qs "$1" "$2") || return 1
     curl -sS -m "$TIMEOUT" --noproxy '*' -A "$UA" -b "$COOKIE" -c "$COOKIE" \
         -H "Referer: $LOGIN_URL" \
         -H "Accept: application/json, text/javascript, */*; q=0.01" \
-        --data-urlencode "data=$data" --data-urlencode "iv=$iv" \
-        -o "$RESP" "${auth_url}?round=$$" || return 1
+        --data-urlencode "data=$data" --data-urlencode "iv=$2" \
+        -o "$RESP" "$3" || return 1
+    return 0
+}
 
-    st=$(sed -n 's/.*"status":[[:space:]]*\([0-9]*\).*/\1/p' "$RESP" | head -n 1)
-    info=$(sed -n 's/.*"info":"\([^"]*\)".*/\1/p' "$RESP" | head -n 1)
-    # decode JSON escapes, then trim surrounding whitespace so one clean line
-    info=$(deesc "$info")
-    info=$(printf '%s' "$info" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+# 返回码：0=已得到服务器结果(经 stdout 返回 OK:/FAIL:)，1=网络/页面出错，2=页面无表单(视为已在线)
+do_login() {
+    fetch_page; prc=$?
+    if [ "$prc" -eq 2 ]; then
+        echo "no login form frmLogin: already online or portal changed"; return 2
+    fi
+    [ "$prc" -eq 0 ] || { echo "login page fetch failed"; return 1; }
+
+    AUTH_URL=$(printf '%s' "$LOGIN_URL" | sed 's|/login$|/authLogin|')
+    qs=$(build_qs "")
+    post_encrypted "$qs" "$iv" "${AUTH_URL}?round=$$" || return 1
+
+    st=$(resp_num status)
+    info=$(resp_info)
     if [ "$st" = 1 ]; then
         echo "OK:$info"
-    else
-        echo "FAIL:$info"
+        return 0
     fi
+
+    reason=$(resp_num reasoncode)
+    bindmac=$(resp_str bindmac)
+
+    if [ "$reason" = 43 ] && [ "$REBIND" != 0 ]; then
+        REBIND_URL=$(printf '%s' "$LOGIN_URL" | sed 's|/login$|/reBindMac|')
+        qs2=$(build_qs "$bindmac")
+        post_encrypted "$qs2" "$iv" "${REBIND_URL}?round=$$" || { echo "FAIL:rebind request error"; return 0; }
+        rst=$(resp_num status)
+        rinfo=$(resp_info)
+        if [ -z "$rst" ] || [ "$rst" = 0 ]; then
+            echo "FAIL:rebind refused: $rinfo"
+            return 0
+        fi
+        echo "rebind ok: $rinfo" >&2
+
+        # 重绑后服务器通常要求重新认证：重新抓页面再登录一次
+        fetch_page; prc=$?
+        if [ "$prc" -eq 2 ]; then
+            echo "OK:rebound, already online"
+            return 0
+        fi
+        [ "$prc" -eq 0 ] || { echo "FAIL:rebound but relogin page fetch failed"; return 0; }
+        qs=$(build_qs "")
+        post_encrypted "$qs" "$iv" "${AUTH_URL}?round=$$" || { echo "FAIL:rebound but relogin request error"; return 0; }
+        st=$(resp_num status)
+        info=$(resp_info)
+        if [ "$st" = 1 ]; then
+            echo "OK:rebound to this device, $info"
+            return 0
+        fi
+        echo "FAIL:rebound but login still failed: $info"
+        return 0
+    fi
+
+    if [ "$reason" = 43 ] && [ "$REBIND" = 0 ]; then
+        echo "FAIL:$info (auto-rebind disabled)"
+        return 0
+    fi
+
+    echo "FAIL:$info"
+    return 0
 }
 
 main() {
@@ -174,6 +256,9 @@ main() {
                 echo "[$attempt/$TRYTIME_MAX] login failed: ${res#FAIL:}"
                 [ "$attempt" -lt "$TRYTIME_MAX" ] && sleep 5  # server rate-limits ~5s
                 ;;
+            *)
+                # 中间步骤信息（如 rebind ok），继续看最终结果
+                echo "$res" ;;
         esac
     done
     return 1

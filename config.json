@@ -5,6 +5,7 @@
   "AES_KEY": "1234567887654321",
   "TRYTIME_MAX": 3,
   "TIMEOUT": 3,
+  "REBIND": 1,
   "CHECK_INTERVAL": 300,
   "ERROR_REPEAT_INTERVAL": 3600,
   "HEAL_INTERVAL": 600,
@@ -14,6 +15,5 @@
   "PING_WAIT": 2,
   "HTTP_CHECK_URLS": "http://wifi.vivo.com.cn/generate_204 http://connectivitycheck.platform.hicloud.com/generate_204",
   "HTTP_CHECK_CODE": 204,
-  "HTTP_TIMEOUT": 5,
-  "FOREIGN_CHECK_URL": ""
+  "HTTP_TIMEOUT": 5
 }
